@@ -26,19 +26,20 @@ jobs:
 
       - name: Install Dell RACADM
         run: |
-          curl -fsSL -A 'Mozilla/5.0' \
-            -o /tmp/idrac-tools.tar.gz \
-            https://dl.dell.com/FOLDER12638439M/1/Dell-iDRACTools-Web-LX-11.3.0.0-795_A00.tar.gz
-          tar -xzf /tmp/idrac-tools.tar.gz -C /tmp
-          sudo dpkg --unpack --force-all /tmp/iDRACTools/racadm/UBUNTU22/x86_64/srvadmin-hapi*.deb \
-            /tmp/iDRACTools/racadm/UBUNTU22/x86_64/srvadmin-idracadm7*.deb \
-            /tmp/iDRACTools/racadm/UBUNTU22/x86_64/srvadmin-idracadm8*.deb
-          if test -e /etc/systemd/system/instsvcdrv.service; then
-            sudo mv /etc/systemd/system/instsvcdrv.service /tmp/instsvcdrv.service
-            sudo ln -s /dev/null /etc/systemd/system/instsvcdrv.service
-          fi
-          sudo DEBIAN_FRONTEND=noninteractive dpkg --configure -a --force-confold || true
-          command -v racadm
+          docker run --rm ubuntu:24.04 bash -euxo pipefail -c '
+            apt-get update
+            apt-get install -y curl tar libargtable2-0 pciutils
+            curl -fsSL -A "Mozilla/5.0" -o /tmp/idrac-tools.tar.gz \
+              https://dl.dell.com/FOLDER12638439M/1/Dell-iDRACTools-Web-LX-11.3.0.0-795_A00.tar.gz
+            tar -xzf /tmp/idrac-tools.tar.gz -C /tmp
+            cd /tmp/iDRACTools/racadm/UBUNTU22/x86_64
+            dpkg --unpack --force-all srvadmin-hapi*.deb srvadmin-idracadm7*.deb srvadmin-idracadm8*.deb
+            if command -v systemctl; then mv "$(command -v systemctl)" /usr/bin/systemctl.real; fi
+            printf "#!/bin/sh\nexit 0\n" > /usr/bin/systemctl
+            chmod +x /usr/bin/systemctl
+            DEBIAN_FRONTEND=noninteractive dpkg --configure -a --force-confold
+            command -v racadm
+          '
 
       - name: Run tests
         run: python -m pytest -q
