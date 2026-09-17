@@ -30,11 +30,14 @@ jobs:
             -o /tmp/idrac-tools.tar.gz \
             https://dl.dell.com/FOLDER12638439M/1/Dell-iDRACTools-Web-LX-11.3.0.0-795_A00.tar.gz
           tar -xzf /tmp/idrac-tools.tar.gz -C /tmp
-          sudo dpkg -i --force-all /tmp/iDRACTools/racadm/UBUNTU22/x86_64/srvadmin-hapi*.deb \
+          sudo dpkg --unpack --force-all /tmp/iDRACTools/racadm/UBUNTU22/x86_64/srvadmin-hapi*.deb \
             /tmp/iDRACTools/racadm/UBUNTU22/x86_64/srvadmin-idracadm7*.deb \
-            /tmp/iDRACTools/racadm/UBUNTU22/x86_64/srvadmin-idracadm8*.deb || true
-          sudo systemctl mask instsvcdrv.service || true
-          sudo dpkg --configure -a || true
+            /tmp/iDRACTools/racadm/UBUNTU22/x86_64/srvadmin-idracadm8*.deb
+          if test -e /etc/systemd/system/instsvcdrv.service; then
+            sudo mv /etc/systemd/system/instsvcdrv.service /tmp/instsvcdrv.service
+            sudo ln -s /dev/null /etc/systemd/system/instsvcdrv.service
+          fi
+          sudo DEBIAN_FRONTEND=noninteractive dpkg --configure -a --force-confold || true
           command -v racadm
 
       - name: Run tests
