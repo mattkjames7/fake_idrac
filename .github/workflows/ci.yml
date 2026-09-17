@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        # actions/checkout@v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Set up Python
+        # actions/setup-python@v5.6.0
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: "3.x"
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ipmitool libargtable2-0
+          python -m pip install pytest
+
+      - name: Install Dell RACADM
+        run: |
+          curl -fsSL -A 'Mozilla/5.0' \
+            -o /tmp/idrac-tools.tar.gz \
+            https://dl.dell.com/FOLDER12638439M/1/Dell-iDRACTools-Web-LX-11.3.0.0-795_A00.tar.gz
+          tar -xzf /tmp/idrac-tools.tar.gz -C /tmp
+          sudo dpkg -i --force-all /tmp/iDRACTools/racadm/UBUNTU22/x86_64/srvadmin-hapi*.deb \
+            /tmp/iDRACTools/racadm/UBUNTU22/x86_64/srvadmin-idracadm7*.deb \
+            /tmp/iDRACTools/racadm/UBUNTU22/x86_64/srvadmin-idracadm8*.deb
+
+      - name: Run tests
+        run: python -m pytest -q
