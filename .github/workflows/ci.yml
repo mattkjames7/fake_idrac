@@ -32,7 +32,10 @@ jobs:
           tar -xzf /tmp/idrac-tools.tar.gz -C /tmp
           sudo dpkg -i --force-all /tmp/iDRACTools/racadm/UBUNTU22/x86_64/srvadmin-hapi*.deb \
             /tmp/iDRACTools/racadm/UBUNTU22/x86_64/srvadmin-idracadm7*.deb \
-            /tmp/iDRACTools/racadm/UBUNTU22/x86_64/srvadmin-idracadm8*.deb
+            /tmp/iDRACTools/racadm/UBUNTU22/x86_64/srvadmin-idracadm8*.deb || true
+          sudo systemctl mask instsvcdrv.service || true
+          sudo dpkg --configure -a || true
+          command -v racadm
 
       - name: Run tests
         run: python -m pytest -q
