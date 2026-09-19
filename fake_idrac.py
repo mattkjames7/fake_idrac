@@ -2,11 +2,16 @@
 """Small in-memory HTTP fake for testing iDRAC fan clients."""
 
 import argparse
+import hashlib
+import hmac
 import json
+import os
 import threading
 import socketserver
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
+
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 
 class FanState:
@@ -56,41 +61,38 @@ class FanState:
 
 
 class IPMIUDPHandler(socketserver.BaseRequestHandler):
-    """Minimal IPMI v1.5/RMCP handler for ipmitool -I lan."""
+    """Minimal IPMI v1.5 and v2.0/RMCP+ handler for ipmitool."""
     state = None
     reservation = 0x42
+    sessions = {}
+    sessions_lock = threading.Lock()
 
     @staticmethod
     def checksum(data):
         return (-sum(data)) & 0xff
 
-    def response(self, request, payload):
+    def ipmi_response(self, message, payload):
         # IPMI response message: responder address/netfn, checksum, requester...
-        message = bytearray((0x81, request[15] | 1))
-        message.append(self.checksum(message))
-        message.extend((request[17], request[18], request[19]))
-        message.extend(payload)
-        message.append(self.checksum(message[3:]))
-        packet = bytes((6, 0, 0xff, 7, 0)) + request[5:13] + bytes((len(message),)) + message
-        return packet
+        response = bytearray((0x81, message[1] | 1))
+        response.append(self.checksum(response))
+        response.extend(message[3:6])
+        response.extend(payload)
+        response.append(self.checksum(response[3:]))
+        return bytes(response)
 
-    def handle(self):
-        request, sock = self.request
-        # Keep the fake quiet by default; set DEBUG_IPMI=1 when diagnosing a client.
-        if request[:4] == bytes((6, 0, 0xff, 6)):
-            pong = bytes.fromhex("06 00 ff 06 00 00 11 be 40 00 00 00 00 00 00 00 00 00 00 00")
-            sock.sendto(pong, self.client_address)
-            return
-        if len(request) < 20:
-            return
-        message = request[14:]
+    def dispatch(self, message):
+        """Return the IPMI response data, including its completion code."""
         command = message[5]
         netfn = message[1] >> 2
         if command == 0x38:  # Get Channel Authentication Capabilities
-            payload = bytes((0, 0x0e, 0x01, 0, 0, 0, 0, 0, 0))  # completion + none auth
-        elif command == 0x39:  # Activate Session
-            payload = bytes((0, 0, 4)) + (0x1234).to_bytes(4, "little") + bytes(4)
-        elif netfn == 0x30 and command == 0x30:
+            # Auth type "none", IPMI 2.0 data available, a named user exists,
+            # and both IPMI 1.5 and 2.0 are supported on this channel.
+            return bytes((0, 0x0e, 0x81, 0x04, 0x03, 0, 0, 0, 0))
+        if command == 0x39:  # Activate Session
+            return bytes((0, 0, 4)) + (0x1234).to_bytes(4, "little") + bytes(4)
+        if command == 0x54:  # Get Channel Cipher Suites (optional discovery)
+            return bytes((0xc1,))
+        if netfn == 0x30 and command == 0x30:
             data = message[6:]
             if data[:2] == bytes((0x01, 0x00)):
                 self.state.manual = True
@@ -103,26 +105,25 @@ class IPMIUDPHandler(socketserver.BaseRequestHandler):
                 pwm = min(data[2], 100)
                 for fan_id in self.state.fans:
                     self.state.set_pwm(fan_id, pwm)
-            payload = bytes((0,))
-        elif netfn == 0x30 and command == 0xce:
+            return bytes((0,))
+        if netfn == 0x30 and command == 0xce:
             data = message[6:]
             if len(data) >= 2 and data[1] == 0x16:
                 if data[0] == 0x01:
-                    payload = bytes((0, int(self.state.pci_fan_response)))
-                else:
-                    self.state.pci_fan_response = not bool(data[8]) if len(data) > 8 else self.state.pci_fan_response
-                    print(f"third-party PCI fan response: {'enabled' if self.state.pci_fan_response else 'disabled'}", flush=True)
-                    payload = bytes((0,))
-            elif len(data) >= 2 and data[1] == 0x09:
+                    return bytes((0, int(self.state.pci_fan_response)))
+                self.state.pci_fan_response = not bool(data[8]) if len(data) > 8 else self.state.pci_fan_response
+                print(f"third-party PCI fan response: {'enabled' if self.state.pci_fan_response else 'disabled'}", flush=True)
+                return bytes((0,))
+            if len(data) >= 2 and data[1] == 0x09:
                 self.state.fan_offset = "high" if data[-3] else "low"
                 print(f"fan offset: {self.state.fan_offset}", flush=True)
-                payload = bytes((0,))
-        elif netfn == 0x0a and command == 0x20:  # Get SDR repository info
+                return bytes((0,))
+        if netfn == 0x0a and command == 0x20:  # Get SDR repository info
             count = len(self.state.fans)
-            payload = bytes((0, 0x51)) + count.to_bytes(2, "little") + bytes((0xff, 0xff)) + bytes(9)
-        elif netfn == 0x0a and command == 0x22:  # Reserve SDR repository
-            payload = bytes((0,)) + self.reservation.to_bytes(2, "little")
-        elif netfn == 0x0a and command == 0x23:  # Get SDR
+            return bytes((0, 0x51)) + count.to_bytes(2, "little") + bytes((0xff, 0xff)) + bytes(9)
+        if netfn == 0x0a and command == 0x22:  # Reserve SDR repository
+            return bytes((0,)) + self.reservation.to_bytes(2, "little")
+        if netfn == 0x0a and command == 0x23:  # Get SDR
             data = message[6:]
             record_id = int.from_bytes(data[2:4], "little") if len(data) >= 4 else 0
             offset = data[4] if len(data) > 4 else 0
@@ -130,20 +131,18 @@ class IPMIUDPHandler(socketserver.BaseRequestHandler):
             records = self.state.sdr_records()
             record = next((r for r in records if int.from_bytes(r[:2], "little") == record_id), b"")
             next_id = record_id + 1 if record_id < len(records) - 1 else 0xffff
-            payload = bytes((0,)) + next_id.to_bytes(2, "little") + record[offset:offset + length]
-        elif netfn == 0x04 and command == 0x2d:  # Get Sensor Reading
+            return bytes((0,)) + next_id.to_bytes(2, "little") + record[offset:offset + length]
+        if netfn == 0x04 and command == 0x2d:  # Get Sensor Reading
             sensor_num = message[6] if len(message) > 6 else 0
             fan_index = sensor_num - 0x4f
             rpm = self.state.fans.get(str(fan_index), {}).get("rpm", 0)
-            # ipmitool's LAN parser expects the completion byte followed by the
-            # reading-validity byte; keep the compact fake reading in range.
-            payload = bytes((0, min(rpm // 100, 100), 0x40, 0))
-        elif netfn == 0x04 and command == 0x27:  # Get Sensor Thresholds
+            return bytes((0, min(rpm // 100, 100), 0x40, 0))
+        if netfn == 0x04 and command == 0x27:  # Get Sensor Thresholds
             sensor_num = message[6] if len(message) > 6 else 0
             fan_id = str(sensor_num - 0x4f)
             values = self.state.fans.get(fan_id, {}).get("thresholds", [0] * 6)
-            payload = bytes((0, *values))
-        elif netfn == 0x04 and command == 0x26:  # Set Sensor Thresholds
+            return bytes((0, *values))
+        if netfn == 0x04 and command == 0x26:  # Set Sensor Thresholds
             data = message[6:]
             sensor_num = data[0] if data else 0
             fan_id = str(sensor_num - 0x4f)
@@ -154,19 +153,151 @@ class IPMIUDPHandler(socketserver.BaseRequestHandler):
                 if mask:
                     values[(mask & -mask).bit_length() - 1] = value
                 self.state.set_thresholds(fan_id, values)
-                payload = bytes((0,))
-            else:
-                payload = bytes((0xc9,))
-        else:
-            # Standard discovery/session commands only need a successful response.
-            payload = bytes((0,))
-            if command == 0x3b:  # Get Device ID
-                payload += bytes((0x20, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0))
-            elif netfn == 0x2c and command in (0x00, 0x3e):
-                # Tell ipmitool's optional PICMG/HPM probes that this fake has no
-                # such extensions; those probes are unrelated to fan control.
-                payload = bytes((0xc1,))
-        sock.sendto(self.response(request, payload), self.client_address)
+                return bytes((0,))
+            return bytes((0xc9,))
+
+        payload = bytes((0,))
+        if command == 0x3b:  # Set Session Privilege Level
+            payload += bytes((message[6] & 0x0f,))
+        elif command == 0x01:  # Get Device ID
+            payload += bytes((0x20, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0))
+        elif netfn == 0x2c and command in (0x00, 0x3e):
+            payload = bytes((0xc1,))
+        return payload
+
+    @staticmethod
+    def rmcpplus_packet(payload_type, payload, session_id=0, sequence=0):
+        return (bytes((6, 0, 0xff, 7, 6, payload_type))
+                + session_id.to_bytes(4, "little")
+                + sequence.to_bytes(4, "little")
+                + len(payload).to_bytes(2, "little") + payload)
+
+    def handle_rmcpplus(self, request):
+        payload_type = request[5] & 0x3f
+        length = int.from_bytes(request[14:16], "little")
+        payload = request[16:16 + length]
+
+        if payload_type == 0x10:  # RMCP+ Open Session Request
+            console_id = int.from_bytes(payload[4:8], "little")
+            bmc_id = int.from_bytes(os.urandom(4), "little") or 1
+            session = {"console_id": console_id, "bmc_id": bmc_id,
+                       "auth": payload[12], "integrity": payload[20],
+                       "crypt": payload[28], "sequence": 1}
+            with self.sessions_lock:
+                self.sessions[bmc_id] = session
+            response = (bytes((payload[0], 0, 4, 0)) + payload[4:8]
+                        + bmc_id.to_bytes(4, "little")
+                        + bytes((0, 0, 0, 8, session["auth"], 0, 0, 0))
+                        + bytes((1, 0, 0, 8, session["integrity"], 0, 0, 0))
+                        + bytes((2, 0, 0, 8, session["crypt"], 0, 0, 0)))
+            return self.rmcpplus_packet(0x11, response)
+
+        if payload_type == 0x12:  # RAKP Message 1
+            bmc_id = int.from_bytes(payload[4:8], "little")
+            session = self.sessions.get(bmc_id)
+            if not session:
+                return None
+            session["console_rand"] = payload[8:24]
+            session["role"] = payload[24]
+            username_length = payload[27]
+            session["username"] = payload[28:28 + username_length]
+            session["bmc_rand"] = os.urandom(16)
+            session["guid"] = bytes.fromhex("00112233445566778899aabbccddeeff")
+            if session["username"] != b"user":
+                response = (bytes((payload[0], 0x0d, 0, 0))
+                            + session["console_id"].to_bytes(4, "little"))
+                return self.rmcpplus_packet(0x13, response)
+            key = b"pass".ljust(20, b"\0")
+            material = (session["console_id"].to_bytes(4, "little")
+                        + bmc_id.to_bytes(4, "little") + session["console_rand"]
+                        + session["bmc_rand"] + session["guid"]
+                        + bytes((session["role"], username_length)) + session["username"])
+            auth_code = hmac.new(key, material, hashlib.sha1).digest() if session["auth"] else b""
+            response = (bytes((payload[0], 0, 0, 0))
+                        + session["console_id"].to_bytes(4, "little")
+                        + session["bmc_rand"] + session["guid"] + auth_code)
+            return self.rmcpplus_packet(0x13, response)
+
+        if payload_type == 0x14:  # RAKP Message 3
+            bmc_id = int.from_bytes(payload[4:8], "little")
+            session = self.sessions.get(bmc_id)
+            if not session:
+                return None
+            key = b"pass".ljust(20, b"\0")
+            rakp3_material = (session["bmc_rand"]
+                              + session["console_id"].to_bytes(4, "little")
+                              + bytes((session["role"], len(session["username"])))
+                              + session["username"])
+            expected = hmac.new(key, rakp3_material, hashlib.sha1).digest()
+            if not hmac.compare_digest(expected, payload[8:28]):
+                response = (bytes((payload[0], 0x0f, 0, 0))
+                            + session["console_id"].to_bytes(4, "little"))
+                return self.rmcpplus_packet(0x15, response)
+            sik_material = (session["console_rand"] + session["bmc_rand"]
+                            + bytes((session["role"], len(session["username"])))
+                            + session["username"])
+            session["sik"] = hmac.new(key, sik_material, hashlib.sha1).digest()
+            session["k1"] = hmac.new(session["sik"], bytes((1,)) * 20, hashlib.sha1).digest()
+            session["k2"] = hmac.new(session["sik"], bytes((2,)) * 20, hashlib.sha1).digest()
+            rakp4_material = (session["console_rand"] + bmc_id.to_bytes(4, "little")
+                              + session["guid"])
+            check = hmac.new(session["sik"], rakp4_material, hashlib.sha1).digest()[:12]
+            response = (bytes((payload[0], 0, 0, 0))
+                        + session["console_id"].to_bytes(4, "little") + check)
+            return self.rmcpplus_packet(0x15, response)
+
+        if payload_type == 0 and not request[5] & 0xc0:
+            # Cipher-suite discovery is sent in an RMCP+ envelope before a
+            # session exists. A prompt error is enough for ipmitool to fall
+            # back to the explicitly/default selected suite without retries.
+            response = self.ipmi_response(payload, self.dispatch(payload))
+            return self.rmcpplus_packet(0, response)
+
+        if payload_type == 0 and request[5] & 0xc0:
+            bmc_id = int.from_bytes(request[6:10], "little")
+            session = self.sessions.get(bmc_id)
+            if not session:
+                return None
+            expected = hmac.new(session["k1"], request[4:-12], hashlib.sha1).digest()[:12]
+            if not hmac.compare_digest(expected, request[-12:]):
+                return None
+            if request[5] & 0x80:
+                iv, ciphertext = payload[:16], payload[16:]
+                padded = Cipher(algorithms.AES(session["k2"][:16]), modes.CBC(iv)).decryptor().update(ciphertext)
+                payload = padded[:-padded[-1] - 1]
+            response = self.ipmi_response(payload, self.dispatch(payload))
+            if session["crypt"]:
+                pad_length = (15 - len(response)) % 16
+                padded = response + bytes(range(1, pad_length + 1)) + bytes((pad_length,))
+                iv = os.urandom(16)
+                response = iv + Cipher(algorithms.AES(session["k2"][:16]), modes.CBC(iv)).encryptor().update(padded)
+            packet = bytearray(self.rmcpplus_packet(0xc0, response, session["console_id"], session["sequence"]))
+            session["sequence"] += 1
+            integrity_padding = (4 - ((len(packet) - 4 + 2) % 4)) % 4
+            packet.extend(bytes((0xff,)) * integrity_padding)
+            packet.extend((integrity_padding, 7))
+            packet.extend(hmac.new(session["k1"], packet[4:], hashlib.sha1).digest()[:12])
+            return bytes(packet)
+        return None
+
+    def handle(self):
+        request, sock = self.request
+        # Keep the fake quiet by default; set DEBUG_IPMI=1 when diagnosing a client.
+        if request[:4] == bytes((6, 0, 0xff, 6)):
+            pong = bytes.fromhex("06 00 ff 06 00 00 11 be 40 00 00 00 00 00 00 00 00 00 00 00")
+            sock.sendto(pong, self.client_address)
+            return
+        if len(request) < 20:
+            return
+        if request[4] == 6:
+            response = self.handle_rmcpplus(request)
+            if response:
+                sock.sendto(response, self.client_address)
+            return
+        message = request[14:]
+        response = self.ipmi_response(message, self.dispatch(message))
+        packet = bytes((6, 0, 0xff, 7, 0)) + request[5:13] + bytes((len(response),)) + response
+        sock.sendto(packet, self.client_address)
 
 
 def serve_ipmi(host, port, state):

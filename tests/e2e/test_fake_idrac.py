@@ -48,9 +48,9 @@ def fake_idrac():
         process.wait(timeout=2)
 
 
-def ipmi(ipmi_port, *args):
+def ipmi(ipmi_port, *args, interface="lan"):
     return subprocess.run(
-        [IPMITOOL, "-I", "lan", "-H", "127.0.0.1", "-p", str(ipmi_port),
+        [IPMITOOL, "-I", interface, "-H", "127.0.0.1", "-p", str(ipmi_port),
          "-U", "user", "-P", "pass", *args],
         check=True,
         capture_output=True,
@@ -67,6 +67,18 @@ def test_ipmitool_sets_all_six_fans(fake_idrac):
     state = json.load(urllib.request.urlopen(f"http://127.0.0.1:{http_port}/state"))
     assert state["manual"] is True
     assert len(state["fans"]) == 6
+    assert {fan["pwm"] for fan in state["fans"]} == {70}
+
+
+@pytest.mark.skipif(IPMITOOL is None, reason="ipmitool is not installed")
+def test_ipmitool_lanplus_sets_all_six_fans(fake_idrac):
+    """Exercise a real IPMI v2.0/RMCP+ authenticated session end to end."""
+    http_port, ipmi_port = fake_idrac
+    ipmi(ipmi_port, "raw", "0x30", "0x30", "0x02", "0xff", "0x46",
+         interface="lanplus")
+
+    state = json.load(urllib.request.urlopen(f"http://127.0.0.1:{http_port}/state"))
+    assert state["manual"] is True
     assert {fan["pwm"] for fan in state["fans"]} == {70}
 
 
