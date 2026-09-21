@@ -73,7 +73,9 @@ class IPMIUDPHandler(socketserver.BaseRequestHandler):
 
     def ipmi_response(self, message, payload):
         # IPMI response message: responder address/netfn, checksum, requester...
-        response = bytearray((0x81, message[1] | 1))
+        # NetFn occupies bits 7:2.  A response uses the following (odd) NetFn;
+        # bit 0 is part of the LUN and must not be used as the response flag.
+        response = bytearray((0x81, message[1] | 0x04))
         response.append(self.checksum(response))
         response.extend(message[3:6])
         response.extend(payload)
@@ -91,7 +93,9 @@ class IPMIUDPHandler(socketserver.BaseRequestHandler):
         if command == 0x39:  # Activate Session
             return bytes((0, 0, 4)) + (0x1234).to_bytes(4, "little") + bytes(4)
         if command == 0x54:  # Get Channel Cipher Suites (optional discovery)
-            return bytes((0xc1,))
+            # Suites 3 (SHA1-96/AES) and 17 (SHA256-128/AES).  Returning
+            # fewer than 16 record bytes also marks this as the final page.
+            return bytes.fromhex("00 0e c0 03 01 41 81 c0 11 03 44 81")
         if netfn == 0x30 and command == 0x30:
             data = message[6:]
             if data[:2] == bytes((0x01, 0x00)):
@@ -207,12 +211,13 @@ class IPMIUDPHandler(socketserver.BaseRequestHandler):
                 response = (bytes((payload[0], 0x0d, 0, 0))
                             + session["console_id"].to_bytes(4, "little"))
                 return self.rmcpplus_packet(0x13, response)
-            key = b"pass".ljust(20, b"\0")
+            key = b"pass"
             material = (session["console_id"].to_bytes(4, "little")
                         + bmc_id.to_bytes(4, "little") + session["console_rand"]
                         + session["bmc_rand"] + session["guid"]
                         + bytes((session["role"], username_length)) + session["username"])
-            auth_code = hmac.new(key, material, hashlib.sha1).digest() if session["auth"] else b""
+            digest = hashlib.sha256 if session["auth"] == 3 else hashlib.sha1
+            auth_code = hmac.new(key, material, digest).digest() if session["auth"] else b""
             response = (bytes((payload[0], 0, 0, 0))
                         + session["console_id"].to_bytes(4, "little")
                         + session["bmc_rand"] + session["guid"] + auth_code)
@@ -223,25 +228,28 @@ class IPMIUDPHandler(socketserver.BaseRequestHandler):
             session = self.sessions.get(bmc_id)
             if not session:
                 return None
-            key = b"pass".ljust(20, b"\0")
+            key = b"pass"
             rakp3_material = (session["bmc_rand"]
                               + session["console_id"].to_bytes(4, "little")
                               + bytes((session["role"], len(session["username"])))
                               + session["username"])
-            expected = hmac.new(key, rakp3_material, hashlib.sha1).digest()
-            if not hmac.compare_digest(expected, payload[8:28]):
+            digest = hashlib.sha256 if session["auth"] == 3 else hashlib.sha1
+            auth_length = digest().digest_size
+            expected = hmac.new(key, rakp3_material, digest).digest()
+            if not hmac.compare_digest(expected, payload[8:8 + auth_length]):
                 response = (bytes((payload[0], 0x0f, 0, 0))
                             + session["console_id"].to_bytes(4, "little"))
                 return self.rmcpplus_packet(0x15, response)
             sik_material = (session["console_rand"] + session["bmc_rand"]
                             + bytes((session["role"], len(session["username"])))
                             + session["username"])
-            session["sik"] = hmac.new(key, sik_material, hashlib.sha1).digest()
-            session["k1"] = hmac.new(session["sik"], bytes((1,)) * 20, hashlib.sha1).digest()
-            session["k2"] = hmac.new(session["sik"], bytes((2,)) * 20, hashlib.sha1).digest()
+            session["sik"] = hmac.new(key, sik_material, digest).digest()
+            session["k1"] = hmac.new(session["sik"], bytes((1,)) * 20, digest).digest()
+            session["k2"] = hmac.new(session["sik"], bytes((2,)) * 20, digest).digest()
             rakp4_material = (session["console_rand"] + bmc_id.to_bytes(4, "little")
                               + session["guid"])
-            check = hmac.new(session["sik"], rakp4_material, hashlib.sha1).digest()[:12]
+            check_length = 16 if session["integrity"] == 4 else 12
+            check = hmac.new(session["sik"], rakp4_material, digest).digest()[:check_length]
             response = (bytes((payload[0], 0, 0, 0))
                         + session["console_id"].to_bytes(4, "little") + check)
             return self.rmcpplus_packet(0x15, response)
@@ -258,8 +266,10 @@ class IPMIUDPHandler(socketserver.BaseRequestHandler):
             session = self.sessions.get(bmc_id)
             if not session:
                 return None
-            expected = hmac.new(session["k1"], request[4:-12], hashlib.sha1).digest()[:12]
-            if not hmac.compare_digest(expected, request[-12:]):
+            digest = hashlib.sha256 if session["integrity"] == 4 else hashlib.sha1
+            auth_length = 16 if session["integrity"] == 4 else 12
+            expected = hmac.new(session["k1"], request[4:-auth_length], digest).digest()[:auth_length]
+            if not hmac.compare_digest(expected, request[-auth_length:]):
                 return None
             if request[5] & 0x80:
                 iv, ciphertext = payload[:16], payload[16:]
@@ -276,7 +286,7 @@ class IPMIUDPHandler(socketserver.BaseRequestHandler):
             integrity_padding = (4 - ((len(packet) - 4 + 2) % 4)) % 4
             packet.extend(bytes((0xff,)) * integrity_padding)
             packet.extend((integrity_padding, 7))
-            packet.extend(hmac.new(session["k1"], packet[4:], hashlib.sha1).digest()[:12])
+            packet.extend(hmac.new(session["k1"], packet[4:], digest).digest()[:auth_length])
             return bytes(packet)
         return None
 

@@ -11,7 +11,20 @@ import pytest
 
 
 ROOT = Path(__file__).parents[2]
+sys.path.insert(0, str(ROOT))
+
+from fake_idrac import IPMIUDPHandler
+
 IPMITOOL = shutil.which("ipmitool")
+
+
+def test_ipmi_response_uses_response_netfn():
+    request = bytes.fromhex("20 18 c8 81 20 38 8e 04 b6")
+    handler = object.__new__(IPMIUDPHandler)
+    response = handler.ipmi_response(request, bytes((0,)))
+
+    assert response[1] >> 2 == (request[1] >> 2) + 1
+    assert response[1] & 0x03 == request[1] & 0x03
 
 
 def free_port():
